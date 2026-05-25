@@ -1,4 +1,3 @@
-"""Driver Script for the ASPLOS OPTNKI Contest"""
 import argparse
 import ast
 import base64
@@ -552,10 +551,12 @@ def main():
         llama_module_name = args.llama
     print(f"Loading model module: {llama_module_name} (enable_nki={args.enable_nki})")
     llama = importlib.import_module(llama_module_name)
-    base_model, _, base_generation_config = prepare_inference(baseline_llama.NeuronLlamaForCausalLM, args)
-    model, tokenizer, generation_config = prepare_inference(llama.NeuronLlamaForCausalLM, args)
 
+    # Lazy baseline compile: only build the baseline model when a mode actually
+    # needs it for comparison (validate / evaluate_*). For `generate`, save the
+    # ~10-20 min baseline compile and only build the target model.
     if args.mode == "generate":
+        model, tokenizer, generation_config = prepare_inference(llama.NeuronLlamaForCausalLM, args)
         run_generation(
             model,
             tokenizer,
@@ -564,6 +565,8 @@ def main():
         )
 
     elif args.mode == "validate":
+        base_model, _, base_generation_config = prepare_inference(baseline_llama.NeuronLlamaForCausalLM, args)
+        model, tokenizer, generation_config = prepare_inference(llama.NeuronLlamaForCausalLM, args)
 
         passed = run_accuracy_check(
             base_model,
@@ -581,6 +584,8 @@ def main():
         print(f"Validation {status}.")
 
     elif args.mode == "evaluate_single":
+        base_model, _, base_generation_config = prepare_inference(baseline_llama.NeuronLlamaForCausalLM, args)
+        model, tokenizer, generation_config = prepare_inference(llama.NeuronLlamaForCausalLM, args)
 
         accuracy = run_accuracy_check(
             base_model,
@@ -610,8 +615,10 @@ def main():
             f"\tThroughput: {throughput}\n"
             f"\tNKI FLOPs Ratio: {nki_flop_ratio}"
         )
-        
+
     elif args.mode == "evaluate_all":
+        base_model, _, base_generation_config = prepare_inference(baseline_llama.NeuronLlamaForCausalLM, args)
+        model, tokenizer, generation_config = prepare_inference(llama.NeuronLlamaForCausalLM, args)
 
         prompts = parse_prompts("prompts.txt")
         prompt_data = parse_prompt_data("prompt_data.txt")
