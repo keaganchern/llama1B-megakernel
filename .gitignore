@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+
+# Neuron compile artifacts
+/tmp/
+traced_model/
+benchmark_report.json
+prompt*_out.txt
+*.log
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
