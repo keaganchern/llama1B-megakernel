@@ -7,7 +7,7 @@ All 16 decoder layers run inside a single `nki.jit` invocation: the residual hid
 
 ## Results
 
-End-to-end on Trainium 1 (trn1.2xlarge), 640 output tokens, batch_size=1, max_context_length=1024 (matches qwen3-moe-megakernel's S_max):
+End-to-end on Trainium 1 (trn1.2xlarge), 640 output tokens, batch_size=1, max_context_length=1024:
 
 | Metric                | Baseline    | Megakernel  |
 |-----------------------|-------------|-------------|
@@ -21,21 +21,6 @@ End-to-end on Trainium 1 (trn1.2xlarge), 640 output tokens, batch_size=1, max_co
 - **Baseline** = NxDI's stock Llama-3.2-1B decode path on trn1: XLA-traced through NxDI module subclasses (`NeuronAttentionBase`, `Column/RowParallelLinear`), `CustomRMSNorm` backed by the `AwsNeuronRmsNorm` XLA custom op, then compiled by `neuron-cc` with its full optimization pipeline. 
 - **Megakernel** = our full multi-layer fused NKI kernel covering all 16 decoder layers in one launch (`--enable-nki=True`).
 
-Current megakernel is the first correctness-validated cut; performance tuning (Phase 5) has not started yet. See PLAN.md.
-
-## Layout
-
-```
-llama.py                       # Baseline NxDI subclass (XLA path, no megakernel)
-llama_with_megakernel.py       # NKI-enabled subclass — selected by --enable-nki
-transformer_llama.py           # Multi-layer megakernel (16-layer fused kernel)
-nki_kernels/                   # Hand-written NKI sub-kernels
-main.py                        # CLI entry point: generate / validate / evaluate                     # Phased implementation plan
-benchmarks/
-  run_baseline.sh              # Baseline benchmark — works today
-  results/
-    baseline.json              # Latest baseline benchmark report
-```
 
 ## Environment
 
