@@ -24,8 +24,9 @@ NUM_KV_HEADS = 8
 GQA = NUM_Q_HEADS // NUM_KV_HEADS                  # 4 query heads per kv-head
 NUM_H_TILES = H // PMAX                            # 16
 HALF_D = D // 2                                    # RoPE split point
-S_MAX = 64                                         # KV cache sequence length
-S_ATT = S_MAX + 1                                  # cache (64) + active (1)
+S_MAX = 1024                                       # KV cache sequence length
+S_TILE = PMAX                                      # flash-attention tile size = 128
+NUM_S_TILES = S_MAX // S_TILE                      # 8 cache tiles
 EPS = 1e-5
 INV_SQRT_D = float(1.0 / math.sqrt(D))             # softmax scale
 MASK_NEG_INF = -3.4028234663852886e38              # torch.finfo(fp32).min
@@ -50,14 +51,17 @@ def attn_block_sbuf(
 ):
     """SBUF-in / SBUF-out fused attention block.
 
-    Step 9's softmax runs over S_ATT = S_MAX + 1 slots: 64 cached positions
-    plus one virtual slot for this step's freshly projected K/V. The causal
-    mask leaves slot s unmasked iff s <= position_ids, naturally including
-    the active slot.
+    Step 9 runs flash-attention with online softmax over NUM_S_TILES cache
+    tiles of S_TILE=PMAX=128 positions each, plus one active-slot iteration
+    for the freshly projected K/V at virtual position S_MAX. The cache mask
+    is built per-tile from (position_ids, t*S_TILE); the active slot is
+    always unmasked.
 
     K_next / V_next are written as a full copy of the input cache plus the
-    freshly projected K/V scattered at row position_ids; the caller aliases
-    them back to the KV-cache parameters.
+    freshly projected K / V scattered at row position_ids; the caller aliases
+    them back to past_key_values. Tried in-place aliasing of K_cache instead —
+    on trn1 the compiler inserts a protective save/restore round-trip that
+    makes HBM traffic worse, not better.
     """
     f32 = nl.float32
     bf16 = nl.bfloat16
@@ -268,109 +272,209 @@ def attn_block_sbuf(
     K_cache_flat = K_cache.reshape((NUM_KV_HEADS * S_MAX, D))
     V_cache_flat = V_cache.reshape((NUM_KV_HEADS * S_MAX, D))
 
-    # 8. Causal mask [S_ATT, 1]: cache slots (0..S_MAX-1) are -inf iff s >= pos
-    # (cache row s holds the prior step's K/V; it is valid only for s < pos).
-    # The active slot S_MAX is always 0 (unmasked).
-    causal_mask = nl.ndarray((S_ATT, 1), dtype=f32, buffer=nl.sbuf)
-    nisa.memset(causal_mask, value=0.0)
-
-    # Build the cache portion: delta = (s + 1) - pos > 0 iff s >= pos.
-    s_idx_f32 = nl.ndarray((S_MAX, 1), dtype=f32, buffer=nl.sbuf)
-    nisa.iota(s_idx_f32, pattern=[[1, 1]], offset=0, channel_multiplier=1)
-    s_plus_1 = nl.ndarray((S_MAX, 1), dtype=f32, buffer=nl.sbuf)
-    nisa.tensor_scalar(s_plus_1, data=s_idx_f32, op0=nl.add, operand0=1.0)
+    # 8. Precompute per-tile mask building blocks.
+    #   iota_st[i] = i for i in 0..S_TILE-1 (S_TILE partitions, 1 free).
+    #   neg_pos    = -pos (scalar).
+    # The per-tile mask is built inside the loop as:
+    #   delta[i] = iota[i] + 1 - pos + t*S_TILE
+    #   mask[i]  = MASK_NEG_INF * min(relu(delta), 1)  (= -inf iff t*S_TILE + i >= pos)
+    iota_st = nl.ndarray((S_TILE, 1), dtype=f32, buffer=nl.sbuf)
+    nisa.iota(iota_st, pattern=[[1, 1]], offset=0, channel_multiplier=1)
     neg_pos = nl.ndarray((1, 1), dtype=f32, buffer=nl.sbuf)
     nisa.tensor_scalar(neg_pos, data=pos_f32, op0=nl.multiply, operand0=-1.0)
-    neg_pos_psum = nl.ndarray((S_MAX, 1), dtype=f32, buffer=nl.psum)
-    nisa.nc_transpose(neg_pos_psum, neg_pos.ap([[1, 1], [0, S_MAX]], offset=0))
-    neg_pos_bcast = nl.ndarray((S_MAX, 1), dtype=f32, buffer=nl.sbuf)
-    nisa.tensor_copy(neg_pos_bcast, neg_pos_psum)
-    delta = nl.ndarray((S_MAX, 1), dtype=f32, buffer=nl.sbuf)
-    nisa.tensor_tensor(delta, s_plus_1, neg_pos_bcast, op=nl.add)
-    relu_delta = nl.ndarray((S_MAX, 1), dtype=f32, buffer=nl.sbuf)
-    nisa.activation(relu_delta, op=nl.relu, data=delta)
-    clamped = nl.ndarray((S_MAX, 1), dtype=f32, buffer=nl.sbuf)
-    nisa.tensor_scalar(clamped, data=relu_delta, op0=nl.minimum, operand0=1.0)
-    cache_mask_64 = nl.ndarray((S_MAX, 1), dtype=f32, buffer=nl.sbuf)
-    nisa.tensor_scalar(cache_mask_64, data=clamped, op0=nl.multiply, operand0=MASK_NEG_INF)
-    nisa.tensor_copy(causal_mask[0:S_MAX, 0:1], cache_mask_64)
 
-    # 9. Per-kv-head attention with virtual-append layout (S_ATT = S_MAX + 1):
-    #   slots 0..S_MAX-1: cache rows from HBM
-    #   slot S_MAX:       active K/V from SBUF
-    # Score = k_aug.T @ Q, softmax over S_ATT, attn = v_aug.T @ softmax.
+    # 9. Per-kv-head flash-attention with online softmax over S_TILE=PMAX chunks.
+    # State per kv-head (in [GQA, *] layout so rescale [GQA, 1] is a per-partition op):
+    #   running_max   [GQA, 1]  init -inf
+    #   running_denom [GQA, 1]  init 0
+    #   running_out   [GQA, D]  init 0
+    # For each cache tile t in 0..NUM_S_TILES:
+    #   compute score, mask, online-update max/denom/out.
+    # Then handle the active slot (S_MAX, always unmasked) as a single-position update.
+    # Final: attn_out = running_out / running_denom, transposed to [D, GQA] for step 10.
     attn_out_per_kv = [None] * NUM_KV_HEADS
 
     for kv in range(NUM_KV_HEADS):
-        # 9a. K_cache[kv] -> SBUF [D, S_MAX] via dma_transpose (D = contraction).
-        k_cache_sb = nl.ndarray((D, S_MAX), dtype=bf16, buffer=nl.sbuf)
-        nisa.dma_transpose(
-            dst=k_cache_sb,
-            src=K_cache_flat[kv * S_MAX:(kv + 1) * S_MAX, :],
-        )
-        # 9b. k_aug = [k_cache | k_active] along the free dim.
-        k_aug = nl.ndarray((D, S_ATT), dtype=bf16, buffer=nl.sbuf)
-        nisa.tensor_copy(k_aug[0:D, 0:S_MAX], k_cache_sb)
-        nisa.tensor_copy(k_aug[0:D, S_MAX:S_ATT], k_active_per_kv[kv])
+        running_max = nl.ndarray((GQA, 1), dtype=f32, buffer=nl.sbuf)
+        nisa.memset(running_max, value=MASK_NEG_INF)
+        running_denom = nl.ndarray((GQA, 1), dtype=f32, buffer=nl.sbuf)
+        nisa.memset(running_denom, value=0.0)
+        running_out = nl.ndarray((GQA, D), dtype=f32, buffer=nl.sbuf)
+        nisa.memset(running_out, value=0.0)
 
-        # 9c. scores = k_aug.T @ Q  → PSUM [S_ATT, GQA].
-        score_psum = nl.ndarray((S_ATT, GQA), dtype=f32, buffer=nl.psum)
-        nisa.memset(score_psum, value=0.0)
-        nisa.nc_matmul(score_psum, stationary=k_aug, moving=q_rope_per_kv[kv])
-        score_scaled = nl.ndarray((S_ATT, GQA), dtype=f32, buffer=nl.sbuf)
-        nisa.tensor_scalar(score_scaled, data=score_psum, op0=nl.multiply, operand0=INV_SQRT_D)
-        score_masked = nl.ndarray((S_ATT, GQA), dtype=f32, buffer=nl.sbuf)
-        nisa.tensor_scalar(score_masked, data=score_scaled, op0=nl.add, operand0=causal_mask)
+        # Python `range` to enable first-tile fast-path branching at compile time.
+        for t in range(NUM_S_TILES):
+            # ----- Load K tile [D, S_TILE] via dma_transpose -----
+            k_tile = nl.ndarray((D, S_TILE), dtype=bf16, buffer=nl.sbuf)
+            nisa.dma_transpose(
+                dst=k_tile,
+                src=K_cache_flat[kv * S_MAX + t * S_TILE:kv * S_MAX + (t + 1) * S_TILE, :],
+            )
 
-        # 9d. Softmax across S_ATT (partition) dim.
-        score_T_psum = nl.ndarray((GQA, S_ATT), dtype=f32, buffer=nl.psum)
-        nisa.nc_transpose(score_T_psum, score_masked)
-        score_T_sb = nl.ndarray((GQA, S_ATT), dtype=f32, buffer=nl.sbuf)
-        nisa.tensor_copy(score_T_sb, score_T_psum)
-        smax_max = nl.ndarray((GQA, 1), dtype=f32, buffer=nl.sbuf)
-        nisa.tensor_reduce(smax_max, op=nl.maximum, data=score_T_sb, axis=(1,))
-        neg_max = nl.ndarray((GQA, 1), dtype=f32, buffer=nl.sbuf)
-        nisa.tensor_scalar(neg_max, data=smax_max, op0=nl.multiply, operand0=-1.0)
-        neg_max_psum = nl.ndarray((S_ATT, GQA), dtype=f32, buffer=nl.psum)
-        nisa.nc_transpose(neg_max_psum, neg_max.ap([[1, GQA], [0, S_ATT]], offset=0))
-        neg_max_bcast = nl.ndarray((S_ATT, GQA), dtype=f32, buffer=nl.sbuf)
-        nisa.tensor_copy(neg_max_bcast, neg_max_psum)
-        score_shifted = nl.ndarray((S_ATT, GQA), dtype=f32, buffer=nl.sbuf)
-        nisa.tensor_tensor(score_shifted, score_masked, neg_max_bcast, op=nl.add)
-        score_exp = nl.ndarray((S_ATT, GQA), dtype=f32, buffer=nl.sbuf)
-        nisa.activation(score_exp, op=nl.exp, data=score_shifted)
-        score_exp_T_psum = nl.ndarray((GQA, S_ATT), dtype=f32, buffer=nl.psum)
-        nisa.nc_transpose(score_exp_T_psum, score_exp)
-        score_exp_T_sb = nl.ndarray((GQA, S_ATT), dtype=f32, buffer=nl.sbuf)
-        nisa.tensor_copy(score_exp_T_sb, score_exp_T_psum)
-        exp_sum = nl.ndarray((GQA, 1), dtype=f32, buffer=nl.sbuf)
-        nisa.tensor_reduce(exp_sum, op=nl.add, data=score_exp_T_sb, axis=(1,))
-        inv_sum = nl.ndarray((GQA, 1), dtype=f32, buffer=nl.sbuf)
-        nisa.reciprocal(inv_sum, exp_sum)
-        inv_sum_psum = nl.ndarray((S_ATT, GQA), dtype=f32, buffer=nl.psum)
-        nisa.nc_transpose(inv_sum_psum, inv_sum.ap([[1, GQA], [0, S_ATT]], offset=0))
-        inv_sum_bcast = nl.ndarray((S_ATT, GQA), dtype=f32, buffer=nl.sbuf)
-        nisa.tensor_copy(inv_sum_bcast, inv_sum_psum)
-        softmax_fp32 = nl.ndarray((S_ATT, GQA), dtype=f32, buffer=nl.sbuf)
-        nisa.tensor_tensor(softmax_fp32, score_exp, inv_sum_bcast, op=nl.multiply)
-        softmax_bf16 = nl.ndarray((S_ATT, GQA), dtype=bf16, buffer=nl.sbuf)
-        nisa.tensor_copy(softmax_bf16, softmax_fp32)
+            # ----- score = k_tile.T @ q_rope → PSUM [S_TILE, GQA] -----
+            score_psum = nl.ndarray((S_TILE, GQA), dtype=f32, buffer=nl.psum)
+            nisa.memset(score_psum, value=0.0)
+            nisa.nc_matmul(score_psum, stationary=k_tile, moving=q_rope_per_kv[kv])
 
-        # 9e. v_aug = [v_cache; v_active_T] along the partition dim.
-        # The active row is a single-partition write at base S_MAX = 64.
-        v_aug = nl.ndarray((S_ATT, D), dtype=bf16, buffer=nl.sbuf)
-        nisa.dma_copy(
-            dst=v_aug[0:S_MAX, 0:D],
-            src=V_cache_flat[kv * S_MAX:(kv + 1) * S_MAX, :],
-        )
-        nisa.tensor_copy(v_aug[S_MAX:S_ATT, 0:D], v_active_T_per_kv[kv])
+            # ----- Build mask [S_TILE, 1], scale + mask in [S_TILE, GQA] -----
+            tile_off_scalar = nl.ndarray((1, 1), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_scalar(tile_off_scalar, data=neg_pos, op0=nl.add,
+                               operand0=float(t * S_TILE + 1))
+            tile_off_psum = nl.ndarray((S_TILE, 1), dtype=f32, buffer=nl.psum)
+            nisa.nc_transpose(tile_off_psum, tile_off_scalar.ap([[1, 1], [0, S_TILE]], offset=0))
+            tile_off_bcast = nl.ndarray((S_TILE, 1), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_copy(tile_off_bcast, tile_off_psum)
+            delta = nl.ndarray((S_TILE, 1), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_tensor(delta, iota_st, tile_off_bcast, op=nl.add)
+            relu_delta = nl.ndarray((S_TILE, 1), dtype=f32, buffer=nl.sbuf)
+            nisa.activation(relu_delta, op=nl.relu, data=delta)
+            clamped = nl.ndarray((S_TILE, 1), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_scalar(clamped, data=relu_delta, op0=nl.minimum, operand0=1.0)
+            mask_tile = nl.ndarray((S_TILE, 1), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_scalar(mask_tile, data=clamped, op0=nl.multiply, operand0=MASK_NEG_INF)
 
-        # 9f. attn = v_aug.T @ softmax (K-axis = S_ATT in partition) → PSUM [D, GQA].
-        attn_psum = nl.ndarray((D, GQA), dtype=f32, buffer=nl.psum)
-        nisa.memset(attn_psum, value=0.0)
-        nisa.nc_matmul(attn_psum, stationary=v_aug, moving=softmax_bf16)
+            score_scaled = nl.ndarray((S_TILE, GQA), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_scalar(score_scaled, data=score_psum, op0=nl.multiply, operand0=INV_SQRT_D)
+            score_masked = nl.ndarray((S_TILE, GQA), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_scalar(score_masked, data=score_scaled, op0=nl.add, operand0=mask_tile)
+
+            # ----- Transpose to [GQA, S_TILE] layout; all softmax math stays here -----
+            # so neg_max becomes a per-partition bias for fused exp(score - max).
+            score_T_psum = nl.ndarray((GQA, S_TILE), dtype=f32, buffer=nl.psum)
+            nisa.nc_transpose(score_T_psum, score_masked)
+            score_T = nl.ndarray((GQA, S_TILE), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_copy(score_T, score_T_psum)
+            tile_max = nl.ndarray((GQA, 1), dtype=f32, buffer=nl.sbuf)
+            nisa.tensor_reduce(tile_max, op=nl.maximum, data=score_T, axis=(1,))
+
+            if t == 0:
+                # First-tile fast-path: running_max = tile_max, no rescale.
+                # tile_exp_T = exp(score_T - tile_max).
+                neg_tile_max = nl.ndarray((GQA, 1), dtype=f32, buffer=nl.sbuf)
+                nisa.tensor_scalar(neg_tile_max, data=tile_max, op0=nl.multiply, operand0=-1.0)
+                tile_exp_T = nl.ndarray((GQA, S_TILE), dtype=f32, buffer=nl.sbuf)
+                nisa.activation(tile_exp_T, op=nl.exp, data=score_T, bias=neg_tile_max)
+                tile_denom = nl.ndarray((GQA, 1), dtype=f32, buffer=nl.sbuf)
+                nisa.tensor_reduce(tile_denom, op=nl.add, data=tile_exp_T, axis=(1,))
+
+                # Establish state directly from this tile (no scaling, running_* is 0).
+                nisa.tensor_copy(running_max, tile_max)
+                nisa.tensor_copy(running_denom, tile_denom)
+                # running_out is set after the V matmul below.
+                rescale = None
+            else:
+                # Subsequent tiles: rescale prior state by exp(running_max - new_max).
+                new_max = nl.ndarray((GQA, 1), dtype=f32, buffer=nl.sbuf)
+                nisa.tensor_tensor(new_max, running_max, tile_max, op=nl.maximum)
+                # Fused: rescale = exp(running_max - new_max) = exp(scale * new_max + bias=running_max).
+                rescale = nl.ndarray((GQA, 1), dtype=f32, buffer=nl.sbuf)
+                nisa.activation(rescale, op=nl.exp, data=new_max,
+                                bias=running_max, scale=-1.0)
+                neg_new_max = nl.ndarray((GQA, 1), dtype=f32, buffer=nl.sbuf)
+                nisa.tensor_scalar(neg_new_max, data=new_max, op0=nl.multiply, operand0=-1.0)
+                # Fused: tile_exp_T = exp(score_T - new_max), per-partition bias.
+                tile_exp_T = nl.ndarray((GQA, S_TILE), dtype=f32, buffer=nl.sbuf)
+                nisa.activation(tile_exp_T, op=nl.exp, data=score_T, bias=neg_new_max)
+                tile_denom = nl.ndarray((GQA, 1), dtype=f32, buffer=nl.sbuf)
+                nisa.tensor_reduce(tile_denom, op=nl.add, data=tile_exp_T, axis=(1,))
+
+                # running_denom = running_denom * rescale + tile_denom.
+                rd_scaled = nl.ndarray((GQA, 1), dtype=f32, buffer=nl.sbuf)
+                nisa.tensor_tensor(rd_scaled, running_denom, rescale, op=nl.multiply)
+                nisa.tensor_tensor(running_denom, rd_scaled, tile_denom, op=nl.add)
+                # running_max := new_max
+                nisa.tensor_copy(running_max, new_max)
+
+            # ----- Load V tile [S_TILE, D] from HBM -----
+            v_tile = nl.ndarray((S_TILE, D), dtype=bf16, buffer=nl.sbuf)
+            nisa.dma_copy(
+                dst=v_tile,
+                src=V_cache_flat[kv * S_MAX + t * S_TILE:kv * S_MAX + (t + 1) * S_TILE, :],
+            )
+
+            # ----- Transpose tile_exp_T [GQA, S_TILE] → bf16 [S_TILE, GQA] for matmul -----
+            tile_exp_pt_psum = nl.ndarray((S_TILE, GQA), dtype=f32, buffer=nl.psum)
+            nisa.nc_transpose(tile_exp_pt_psum, tile_exp_T)
+            tile_exp_bf16 = nl.ndarray((S_TILE, GQA), dtype=bf16, buffer=nl.sbuf)
+            nisa.tensor_copy(tile_exp_bf16, tile_exp_pt_psum)
+
+            # ----- tile_out [GQA, D] = tile_exp.T @ v_tile -----
+            tile_out_psum = nl.ndarray((GQA, D), dtype=f32, buffer=nl.psum)
+            nisa.memset(tile_out_psum, value=0.0)
+            nisa.nc_matmul(tile_out_psum, stationary=tile_exp_bf16, moving=v_tile)
+
+            if t == 0:
+                # running_out = tile_out (no prior state to rescale).
+                nisa.tensor_copy(running_out, tile_out_psum)
+            else:
+                # running_out = running_out * rescale + tile_out.
+                ro_scaled = nl.ndarray((GQA, D), dtype=f32, buffer=nl.sbuf)
+                nisa.tensor_scalar(ro_scaled, data=running_out, op0=nl.multiply, operand0=rescale)
+                nisa.tensor_tensor(running_out, ro_scaled, tile_out_psum, op=nl.add)
+
+        # ----- Active slot: one more position at virtual slot S_MAX, always unmasked -----
+        # Same online-softmax pattern with S=1.
+        # score_active [1, GQA] = k_active.T @ q_rope
+        score_active_psum = nl.ndarray((1, GQA), dtype=f32, buffer=nl.psum)
+        nisa.memset(score_active_psum, value=0.0)
+        nisa.nc_matmul(score_active_psum,
+                       stationary=k_active_per_kv[kv],
+                       moving=q_rope_per_kv[kv])
+        score_active_scaled = nl.ndarray((1, GQA), dtype=f32, buffer=nl.sbuf)
+        nisa.tensor_scalar(score_active_scaled, data=score_active_psum,
+                           op0=nl.multiply, operand0=INV_SQRT_D)
+
+        # tile_max_act [GQA, 1] = transpose([1, GQA])
+        tile_max_act_psum = nl.ndarray((GQA, 1), dtype=f32, buffer=nl.psum)
+        nisa.nc_transpose(tile_max_act_psum, score_active_scaled)
+        tile_max_act = nl.ndarray((GQA, 1), dtype=f32, buffer=nl.sbuf)
+        nisa.tensor_copy(tile_max_act, tile_max_act_psum)
+
+        new_max_act = nl.ndarray((GQA, 1), dtype=f32, buffer=nl.sbuf)
+        nisa.tensor_tensor(new_max_act, running_max, tile_max_act, op=nl.maximum)
+        # Fused: rescale_act = exp(running_max - new_max_act).
+        rescale_act = nl.ndarray((GQA, 1), dtype=f32, buffer=nl.sbuf)
+        nisa.activation(rescale_act, op=nl.exp, data=new_max_act,
+                        bias=running_max, scale=-1.0)
+        # Fused: tile_exp_act = exp(tile_max_act - new_max_act).
+        tile_exp_act = nl.ndarray((GQA, 1), dtype=f32, buffer=nl.sbuf)
+        nisa.activation(tile_exp_act, op=nl.exp, data=new_max_act,
+                        bias=tile_max_act, scale=-1.0)
+
+        # running_denom = running_denom * rescale_act + tile_exp_act
+        rd_scaled_act = nl.ndarray((GQA, 1), dtype=f32, buffer=nl.sbuf)
+        nisa.tensor_tensor(rd_scaled_act, running_denom, rescale_act, op=nl.multiply)
+        nisa.tensor_tensor(running_denom, rd_scaled_act, tile_exp_act, op=nl.add)
+
+        # tile_out_act [GQA, D] = tile_exp_act @ v_active.T (rank-1 outer product via matmul with K=1)
+        # stationary [1, GQA]: tile_exp_act.T
+        tile_exp_act_T_psum = nl.ndarray((1, GQA), dtype=f32, buffer=nl.psum)
+        nisa.nc_transpose(tile_exp_act_T_psum, tile_exp_act)
+        tile_exp_act_T_sb = nl.ndarray((1, GQA), dtype=bf16, buffer=nl.sbuf)
+        nisa.tensor_copy(tile_exp_act_T_sb, tile_exp_act_T_psum)
+        # moving [1, D]: v_active_T_per_kv[kv]
+        tile_out_act_psum = nl.ndarray((GQA, D), dtype=f32, buffer=nl.psum)
+        nisa.memset(tile_out_act_psum, value=0.0)
+        nisa.nc_matmul(tile_out_act_psum,
+                       stationary=tile_exp_act_T_sb,
+                       moving=v_active_T_per_kv[kv])
+
+        # running_out = running_out * rescale_act + tile_out_act
+        ro_scaled_act = nl.ndarray((GQA, D), dtype=f32, buffer=nl.sbuf)
+        nisa.tensor_scalar(ro_scaled_act, data=running_out, op0=nl.multiply, operand0=rescale_act)
+        nisa.tensor_tensor(running_out, ro_scaled_act, tile_out_act_psum, op=nl.add)
+
+        # ----- Final divide: attn_out_qd = running_out / running_denom -----
+        inv_denom = nl.ndarray((GQA, 1), dtype=f32, buffer=nl.sbuf)
+        nisa.reciprocal(inv_denom, running_denom)
+        attn_out_qd = nl.ndarray((GQA, D), dtype=f32, buffer=nl.sbuf)
+        nisa.tensor_scalar(attn_out_qd, data=running_out, op0=nl.multiply, operand0=inv_denom)
+
+        # ----- Transpose [GQA, D] → [D, GQA] for step 10 -----
+        attn_kv_psum = nl.ndarray((D, GQA), dtype=f32, buffer=nl.psum)
+        nisa.nc_transpose(attn_kv_psum, attn_out_qd)
         attn_kv = nl.ndarray((D, GQA), dtype=bf16, buffer=nl.sbuf)
-        nisa.tensor_copy(attn_kv, attn_psum)
+        nisa.tensor_copy(attn_kv, attn_kv_psum)
         attn_out_per_kv[kv] = attn_kv
 
     # 10. Pack per-kv-head outputs into a [D, NUM_Q_HEADS] tile.
@@ -421,33 +525,52 @@ def attn_block_sbuf(
         nisa.nc_transpose(col_T_psum, row_sb)
         nisa.tensor_copy(out_sb[0:PMAX, ht:ht + 1], col_T_psum)
 
-    # 12. Build K_next / V_next: full copy of the input cache, then scatter the
-    # freshly projected K / V at row (kv * S_MAX + position_ids). The caller
-    # aliases K_next / V_next back to past_key_values for the next step.
+    # 12. Build K_next / V_next: full copy of the input cache, then scatter
+    # the freshly projected K / V per kv-head at row (kv*S_MAX + position_ids).
+    # The caller aliases K_next / V_next back to past_key_values for the next step.
     K_next_flat = K_next.reshape((NUM_KV_HEADS * S_MAX, D))
     V_next_flat = V_next.reshape((NUM_KV_HEADS * S_MAX, D))
     nisa.dma_copy(dst=K_next_flat, src=K_cache_flat)
     nisa.dma_copy(dst=V_next_flat, src=V_cache_flat)
 
+    # Coalesced source: pack all NUM_KV_HEADS active rows into a single SBUF tile
+    # [NUM_KV_HEADS partition, D free] and issue ONE dma_copy per K / V with a
+    # multi-row .ap() pattern striding through kv-head sections at S_MAX * D.
+    k_active_pack_perD = nl.ndarray((D, NUM_KV_HEADS), dtype=bf16, buffer=nl.sbuf)
+    v_active_pack_perD = nl.ndarray((D, NUM_KV_HEADS), dtype=bf16, buffer=nl.sbuf)
     for kv in range(NUM_KV_HEADS):
-        nisa.dma_copy(
-            dst=K_next_flat.ap(
-                pattern=[[D, 1], [1, D]],
-                offset=kv * S_MAX * D,
-                scalar_offset=pos_u32,
-                indirect_dim=0,
-            ),
-            src=k_active_T_per_kv[kv],
-        )
-        nisa.dma_copy(
-            dst=V_next_flat.ap(
-                pattern=[[D, 1], [1, D]],
-                offset=kv * S_MAX * D,
-                scalar_offset=pos_u32,
-                indirect_dim=0,
-            ),
-            src=v_active_T_per_kv[kv],
-        )
+        nisa.tensor_copy(k_active_pack_perD[0:D, kv:kv + 1], k_active_per_kv[kv])
+        nisa.tensor_copy(v_active_pack_perD[0:D, kv:kv + 1], v_active_per_kv[kv])
+
+    k_active_pack_T_psum = nl.ndarray((NUM_KV_HEADS, D), dtype=f32, buffer=nl.psum)
+    v_active_pack_T_psum = nl.ndarray((NUM_KV_HEADS, D), dtype=f32, buffer=nl.psum)
+    nisa.nc_transpose(k_active_pack_T_psum, k_active_pack_perD)
+    nisa.nc_transpose(v_active_pack_T_psum, v_active_pack_perD)
+    k_active_pack_T = nl.ndarray((NUM_KV_HEADS, D), dtype=bf16, buffer=nl.sbuf)
+    v_active_pack_T = nl.ndarray((NUM_KV_HEADS, D), dtype=bf16, buffer=nl.sbuf)
+    nisa.tensor_copy(k_active_pack_T, k_active_pack_T_psum)
+    nisa.tensor_copy(v_active_pack_T, v_active_pack_T_psum)
+
+    # scalar_offset=pos shifts each kv-head's row by pos*D within its section
+    # (indirect_dim=0 → indirect_stride = D for K_next_flat = [n_kv*S_MAX, D]).
+    nisa.dma_copy(
+        dst=K_next_flat.ap(
+            pattern=[[S_MAX * D, NUM_KV_HEADS], [1, D]],
+            offset=0,
+            scalar_offset=pos_u32,
+            indirect_dim=0,
+        ),
+        src=k_active_pack_T,
+    )
+    nisa.dma_copy(
+        dst=V_next_flat.ap(
+            pattern=[[S_MAX * D, NUM_KV_HEADS], [1, D]],
+            offset=0,
+            scalar_offset=pos_u32,
+            indirect_dim=0,
+        ),
+        src=v_active_pack_T,
+    )
 
 
 @nki.jit
@@ -458,8 +581,8 @@ def attn_kernel(
     Wv_pt,                # [n_kv*PMAX=1024, n_h_tiles*D=1024] bf16 HBM
     Wo,                   # [n_q*D=2048, H=2048] bf16 HBM
     gamma_pre_attn,       # [H=2048] bf16 HBM
-    K_cache,              # [1, n_kv=8, S_MAX=64, D=64] bf16 HBM, read-only input
-    V_cache,              # [1, n_kv=8, S_MAX=64, D=64] bf16 HBM, read-only input
+    K_cache,              # [1, n_kv=8, S_MAX=1024, D=64] bf16 HBM, read-only input
+    V_cache,              # [1, n_kv=8, S_MAX=1024, D=64] bf16 HBM, read-only input
     cos,                  # [1, 1, D=64] bf16 HBM
     sin,                  # [1, 1, D=64] bf16 HBM
     position_ids,         # [1, 1] int32 HBM
@@ -472,7 +595,6 @@ def attn_kernel(
     """
     bf16 = nl.bfloat16
 
-    # Load hidden HBM [1, 1, H] → SBUF [PMAX, NUM_H_TILES].
     hidden_sb = nl.ndarray((PMAX, NUM_H_TILES), dtype=bf16, buffer=nl.sbuf)
     nisa.dma_copy(
         dst=hidden_sb,

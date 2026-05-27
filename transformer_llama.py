@@ -41,7 +41,7 @@ def _layer_body_sbuf(
     h_in_sb,            # [PMAX, NUM_H_TILES] bf16 SBUF
     Wq_all, Wk_all, Wv_all, Wo_all,       # cat-stacked attention weights
     gpre_all,                              # cat-stacked pre-attn gamma [L*H]
-    W_gate_all, W_up_all, W_down_all,      # cat-stacked MLP weights
+    W_gate_up_all, W_down_all,             # cat-stacked MLP weights (gate+up fused)
     gpost_all,                             # cat-stacked post-attn gamma [L*H]
     K_cache_i, V_cache_i,                  # input KV cache for this layer (read-only)
     K_next_i, V_next_i,                    # fresh HBM outputs for this layer
@@ -72,7 +72,7 @@ def _layer_body_sbuf(
     mlp_out_sb = nl.ndarray((PMAX, NUM_H_TILES), dtype=bf16, buffer=nl.sbuf)
     mlp_block_sbuf(
         h_sbuf=h1,
-        W_gate_pt=W_gate_all, W_up_pt=W_up_all, W_down_pt=W_down_all,
+        W_gate_up_pt=W_gate_up_all, W_down_pt=W_down_all,
         gamma_post_attn=gpost_all,
         out_sb=mlp_out_sb,
         layer_idx=layer_idx,
@@ -93,8 +93,7 @@ def _multilayer_body(
     Wv_all,                   # [L*n_kv*PMAX, NUM_H_TILES*D]
     Wo_all,                   # [L*n_q*D, H]
     gpre_all,                 # [L*H] cat-stacked pre-attn gamma
-    Wg_all,                   # [L*NUM_I_TILES*PMAX, NUM_H_TILES*PMAX]
-    Wu_all,                   # [L*NUM_I_TILES*PMAX, NUM_H_TILES*PMAX]
+    Wgu_all,                  # [L*NUM_I_TILES*PMAX, 2*NUM_H_TILES*PMAX]  gate+up fused
     Wd_all,                   # [L*NUM_H_TILES*PMAX, NUM_I_TILES*PMAX]
     gpost_all,                # [L*H] cat-stacked post-attn gamma
     K_caches,                 # tuple of L HBM tensors [1, n_kv, S_MAX, D]
@@ -117,7 +116,9 @@ def _multilayer_body(
     # Per-layer loop. Python `range` so the body is unrolled at trace time;
     # the compiler then overlaps DMAs of layer i+1's weights with compute on
     # layer i. Each layer writes a fresh K_next_i / V_next_i shared_hbm output
-    # which the caller aliases back to past_key_values[i].
+    # which the caller aliases back to past_key_values[i]. Tried in-place
+    # aliasing — on trn1 the compiler inserts a protective save/restore that
+    # makes HBM traffic worse than the wholesale copy.
     K_nexts = []
     V_nexts = []
     for i in range(num_layers):
@@ -127,7 +128,7 @@ def _multilayer_body(
             h_sb,
             Wq_all, Wk_all, Wv_all, Wo_all,
             gpre_all,
-            Wg_all, Wu_all, Wd_all,
+            Wgu_all, Wd_all,
             gpost_all,
             K_caches[i], V_caches[i],
             K_next_i, V_next_i,
@@ -161,7 +162,7 @@ def transformer_llama_megakernel_1layer(
     X,
     Wq_pt, Wk_pt, Wv_pt, Wo,
     gamma_pre_attn,
-    W_gate_pt, W_up_pt, W_down_pt,
+    W_gate_up_pt, W_down_pt,
     gamma_post_attn,
     K_cache, V_cache,
     cos, sin, position_ids,
@@ -182,7 +183,7 @@ def transformer_llama_megakernel_1layer(
         h_sbuf,
         Wq_pt, Wk_pt, Wv_pt, Wo,
         gamma_pre_attn,
-        W_gate_pt, W_up_pt, W_down_pt,
+        W_gate_up_pt, W_down_pt,
         gamma_post_attn,
         K_cache, V_cache,
         K_next, V_next,
@@ -208,7 +209,7 @@ def _build_multilayer_kernel(num_layers: int):
         ["X",
          "Wq_all", "Wk_all", "Wv_all", "Wo_all",
          "gpre_all",
-         "Wg_all", "Wu_all", "Wd_all",
+         "Wgu_all", "Wd_all",
          "gpost_all"]
         + k_args + v_args
         + ["cos", "sin", "position_ids"]
@@ -224,7 +225,7 @@ def _build_multilayer_kernel(num_layers: int):
         f"    V_caches = ({v_tuple},)\n"
         f"    return _multilayer_body(\n"
         f"        X, Wq_all, Wk_all, Wv_all, Wo_all, gpre_all,\n"
-        f"        Wg_all, Wu_all, Wd_all, gpost_all,\n"
+        f"        Wgu_all, Wd_all, gpost_all,\n"
         f"        K_caches, V_caches, cos, sin, position_ids,\n"
         f"        num_layers={num_layers},\n"
         f"    )\n"

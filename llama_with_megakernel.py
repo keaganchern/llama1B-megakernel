@@ -139,14 +139,16 @@ class NeuronLlamaDecoderLayerMK(NeuronLlamaDecoderLayer):
                 parent.layers[i].post_attention_layernorm.weight for i in range(L)
             ], dim=0)
 
-            Wg_stack = torch.cat([
-                _tile_transpose_mlp(parent.layers[i].mlp.gate_proj.weight,
-                                    NUM_I_TILES, NUM_H_TILES)
-                for i in range(L)
-            ], dim=0)
-            Wu_stack = torch.cat([
-                _tile_transpose_mlp(parent.layers[i].mlp.up_proj.weight,
-                                    NUM_I_TILES, NUM_H_TILES)
+            # Fuse W_gate + W_up along the free dim (cols) so one DMA per
+            # m-tile loads both stationaries contiguously. Per-layer shape:
+            # [NUM_I_TILES*PMAX, 2*NUM_H_TILES*PMAX] = [8192, 4096].
+            Wgu_stack = torch.cat([
+                torch.cat([
+                    _tile_transpose_mlp(parent.layers[i].mlp.gate_proj.weight,
+                                        NUM_I_TILES, NUM_H_TILES),
+                    _tile_transpose_mlp(parent.layers[i].mlp.up_proj.weight,
+                                        NUM_I_TILES, NUM_H_TILES),
+                ], dim=1)
                 for i in range(L)
             ], dim=0)
             Wd_stack = torch.cat([
@@ -167,7 +169,7 @@ class NeuronLlamaDecoderLayerMK(NeuronLlamaDecoderLayer):
             pos_i32 = position_ids.to(torch.int32)
 
             # The megakernel is hardcoded for TP=1, 32 Q heads, 8 KV heads,
-            # H=2048, S_MAX=64. Assert config agreement.
+            # H=2048, S_MAX=1024. Assert config agreement.
             nc = self._parent_model.config.neuron_config
             assert nc.tp_degree == 1, (
                 f"megakernel is TP=1 only, got tp_degree={nc.tp_degree}"
@@ -178,20 +180,19 @@ class NeuronLlamaDecoderLayerMK(NeuronLlamaDecoderLayer):
             assert tuple(Wo_stack.shape) == (L * 32 *  64, 2048),    tuple(Wo_stack.shape)
             assert tuple(gpre_stack.shape) == (L * 2048,),           tuple(gpre_stack.shape)
             assert tuple(gpost_stack.shape) == (L * 2048,),          tuple(gpost_stack.shape)
-            assert tuple(Wg_stack.shape) == (L * 8192, 2048),        tuple(Wg_stack.shape)
-            assert tuple(Wu_stack.shape) == (L * 8192, 2048),        tuple(Wu_stack.shape)
+            assert tuple(Wgu_stack.shape) == (L * 8192, 2 * 2048),   tuple(Wgu_stack.shape)
             assert tuple(Wd_stack.shape) == (L * 2048, 8192),        tuple(Wd_stack.shape)
             for i, k in enumerate(K_caches):
-                assert tuple(k.shape) == (1, 8, 64, 64), f"K_caches[{i}].shape={tuple(k.shape)}"
+                assert tuple(k.shape) == (1, 8, 1024, 64), f"K_caches[{i}].shape={tuple(k.shape)}"
             for i, v in enumerate(V_caches):
-                assert tuple(v.shape) == (1, 8, 64, 64), f"V_caches[{i}].shape={tuple(v.shape)}"
+                assert tuple(v.shape) == (1, 8, 1024, 64), f"V_caches[{i}].shape={tuple(v.shape)}"
 
             # Returns (Y, K_0, ..., K_{L-1}, V_0, ..., V_{L-1}).
             mk_results = transformer_llama_megakernel_16layers(
                 hidden_states,
                 Wq_stack, Wk_stack, Wv_stack, Wo_stack,
                 gpre_stack,
-                Wg_stack, Wu_stack, Wd_stack,
+                Wgu_stack, Wd_stack,
                 gpost_stack,
                 *K_caches, *V_caches,
                 cos_cache, sin_cache, pos_i32,

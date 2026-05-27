@@ -11,6 +11,10 @@ Tile-transposed weight layout (caller pre-shuffles):
   W_gate, W_up [I, H] → reshape(NUM_I_TILES, PMAX, NUM_H_TILES, PMAX)
                        .permute(0, 3, 2, 1)
                        .reshape(NUM_I_TILES*PMAX, NUM_H_TILES*PMAX)
+  Then W_gate and W_up are cat'd along the free dim into a single
+  W_gate_up [NUM_I_TILES*PMAX, 2*NUM_H_TILES*PMAX] so one DMA per m-tile
+  loads both stationaries in one contiguous read.
+
   W_down       [H, I] → reshape(NUM_H_TILES, PMAX, NUM_I_TILES, PMAX)
                        .permute(0, 3, 2, 1)
                        .reshape(NUM_H_TILES*PMAX, NUM_I_TILES*PMAX)
@@ -32,8 +36,7 @@ EPS = 1e-5
 
 def mlp_block_sbuf(
     h_sbuf,            # [PMAX, NUM_H_TILES] bf16 SBUF — pre-norm input
-    W_gate_pt,         # [L*NUM_I_TILES*PMAX, NUM_H_TILES*PMAX] bf16 HBM, tile-transposed
-    W_up_pt,           # same shape as W_gate_pt
+    W_gate_up_pt,      # [L*NUM_I_TILES*PMAX, 2*NUM_H_TILES*PMAX] bf16 HBM — gate+up fused
     W_down_pt,         # [L*NUM_H_TILES*PMAX, NUM_I_TILES*PMAX] bf16 HBM, tile-transposed
     gamma_post_attn,   # [L*H] bf16 HBM (1-D)
     out_sb,            # [PMAX, NUM_H_TILES] bf16 SBUF — destination
@@ -78,17 +81,24 @@ def mlp_block_sbuf(
     # 3. Gate + Up + SwiGLU: one I-output tile at a time, streaming weights.
     # For each m ∈ [0, NUM_I_TILES):
     #   mlp_inter_sb[:, m] = SiLU(h_normed @ W_gate[m]) * (h_normed @ W_up[m])
-    # Row offsets use a single absolute index folding layer_idx + m.
+    # Row offsets use a single absolute index folding layer_idx + m. W_gate
+    # and W_up are fused along the free dim of the HBM tensor: cols
+    # [0:NUM_H_TILES*PMAX] hold W_gate, cols [NUM_H_TILES*PMAX:2*NUM_H_TILES*PMAX]
+    # hold W_up. One DMA per m-tile loads both stationaries in a single
+    # 2x-wider contiguous read.
     mlp_inter_sb = nl.ndarray((PMAX, NUM_I_TILES), dtype=bf16, buffer=nl.sbuf)
 
-    _wgu_row_stride = NUM_H_TILES * PMAX     # elements per row
+    _wgu_cols = NUM_H_TILES * PMAX           # per-weight free-dim width
+    _wgu_row_stride = 2 * _wgu_cols          # fused row stride (gate cols + up cols)
     _wgu_layer_rows = NUM_I_TILES * PMAX     # rows per layer
 
     for m in nl.affine_range(NUM_I_TILES):
-        wg_t = nl.ndarray((PMAX, NUM_H_TILES * PMAX), dtype=bf16, buffer=nl.sbuf)
+        # Single fused DMA loads [PMAX, 2*NUM_H_TILES*PMAX] = both gate and up.
+        # gate stationary lives at cols [0:_wgu_cols], up at [_wgu_cols:2*_wgu_cols].
+        wgu_t = nl.ndarray((PMAX, 2 * _wgu_cols), dtype=bf16, buffer=nl.sbuf)
         nisa.dma_copy(
-            dst=wg_t,
-            src=W_gate_pt.ap(
+            dst=wgu_t,
+            src=W_gate_up_pt.ap(
                 pattern=[[_wgu_row_stride, PMAX], [1, _wgu_row_stride]],
                 offset=(layer_idx * _wgu_layer_rows + m * PMAX) * _wgu_row_stride,
             ),
@@ -99,25 +109,16 @@ def mlp_block_sbuf(
         for h_t in nl.affine_range(NUM_H_TILES):
             nisa.nc_matmul(
                 gate_psum,
-                stationary=wg_t[0:PMAX, h_t * PMAX:(h_t + 1) * PMAX],
+                stationary=wgu_t[0:PMAX, h_t * PMAX:(h_t + 1) * PMAX],
                 moving=h_normed[0:PMAX, h_t:h_t + 1],
             )
-
-        wu_t = nl.ndarray((PMAX, NUM_H_TILES * PMAX), dtype=bf16, buffer=nl.sbuf)
-        nisa.dma_copy(
-            dst=wu_t,
-            src=W_up_pt.ap(
-                pattern=[[_wgu_row_stride, PMAX], [1, _wgu_row_stride]],
-                offset=(layer_idx * _wgu_layer_rows + m * PMAX) * _wgu_row_stride,
-            ),
-        )
 
         up_psum = nl.ndarray((PMAX, 1), dtype=f32, buffer=nl.psum)
         nisa.memset(up_psum, value=0.0)
         for h_t in nl.affine_range(NUM_H_TILES):
             nisa.nc_matmul(
                 up_psum,
-                stationary=wu_t[0:PMAX, h_t * PMAX:(h_t + 1) * PMAX],
+                stationary=wgu_t[0:PMAX, _wgu_cols + h_t * PMAX:_wgu_cols + (h_t + 1) * PMAX],
                 moving=h_normed[0:PMAX, h_t:h_t + 1],
             )
 
@@ -161,8 +162,7 @@ def mlp_block_sbuf(
 @nki.jit
 def mlp_kernel(
     hidden_hbm,           # [1, 1, H=2048] bf16 HBM
-    W_gate_pt,            # [I_TILES*PMAX=8192, H_TILES*PMAX=2048] bf16 HBM
-    W_up_pt,              # same
+    W_gate_up_pt,         # [I_TILES*PMAX=8192, 2*H_TILES*PMAX=4096] bf16 HBM, gate+up fused
     W_down_pt,            # [H_TILES*PMAX=2048, I_TILES*PMAX=8192] bf16 HBM
     gamma_post_attn,      # [H=2048] bf16 HBM
 ):
@@ -180,7 +180,7 @@ def mlp_kernel(
     out_sb = nl.ndarray((PMAX, NUM_H_TILES), dtype=bf16, buffer=nl.sbuf)
     mlp_block_sbuf(
         h_sbuf=hidden_sb,
-        W_gate_pt=W_gate_pt, W_up_pt=W_up_pt, W_down_pt=W_down_pt,
+        W_gate_up_pt=W_gate_up_pt, W_down_pt=W_down_pt,
         gamma_post_attn=gamma_post_attn,
         out_sb=out_sb,
     )

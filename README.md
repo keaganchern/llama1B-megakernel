@@ -4,15 +4,37 @@ A multi-layer NKI megakernel for Llama-3.2-1B token-generation inference on AWS 
 
 All 16 decoder layers run inside a single `nki.jit` invocation: the residual hidden state stays SBUF-resident across layer boundaries, per-layer weights stream in from cat-stacked HBM tensors via absolute-offset `.ap()` reads, and each layer returns fresh shared_hbm KV-cache outputs that NxDI's function-level `input_output_aliases` threads back to `past_key_values[i]` for the next decode step.
 
+
+## Results
+
+End-to-end on Trainium 1 (trn1.2xlarge), 640 output tokens, batch_size=1, max_context_length=1024 (matches qwen3-moe-megakernel's S_max):
+
+| Metric                | Baseline    | Megakernel  |
+|-----------------------|-------------|-------------|
+| Token gen latency p50 | 11.11 ms    | 45.41 ms    | 
+| Token gen throughput  | 90.56 tok/s | 22.05 tok/s | 
+| E2E throughput        | 76.01 tok/s | 21.18 tok/s | 
+
+
+
+**Conditions:**
+- **Baseline** = NxDI's stock Llama-3.2-1B decode path on trn1: XLA-traced through NxDI module subclasses (`NeuronAttentionBase`, `Column/RowParallelLinear`), `CustomRMSNorm` backed by the `AwsNeuronRmsNorm` XLA custom op, then compiled by `neuron-cc` with its full optimization pipeline. 
+- **Megakernel** = our full multi-layer fused NKI kernel covering all 16 decoder layers in one launch (`--enable-nki=True`).
+
+Current megakernel is the first correctness-validated cut; performance tuning (Phase 5) has not started yet. See PLAN.md.
+
 ## Layout
 
 ```
-llama.py                       # Baseline NxDI subclass (XLA-only, no NKI)
+llama.py                       # Baseline NxDI subclass (XLA path, no megakernel)
 llama_with_megakernel.py       # NKI-enabled subclass — selected by --enable-nki
-transformer_llama.py           # Multi-layer megakernel factory (1-layer + 2-layer + 16-layer)
-nki_kernels/attention.py       # Fused attention block (RMSNorm + QKV + RoPE + softmax + O)
-nki_kernels/mlp.py             # Fused dense MLP block (RMSNorm + SwiGLU + down)
-main.py                        # CLI entry point: generate / validate / evaluate
+transformer_llama.py           # Multi-layer megakernel (16-layer fused kernel)
+nki_kernels/                   # Hand-written NKI sub-kernels
+main.py                        # CLI entry point: generate / validate / evaluate                     # Phased implementation plan
+benchmarks/
+  run_baseline.sh              # Baseline benchmark — works today
+  results/
+    baseline.json              # Latest baseline benchmark report
 ```
 
 ## Environment
@@ -22,27 +44,30 @@ source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 export NEURON_PLATFORM_TARGET_OVERRIDE=trn1
 ```
 
-## Generating with the megakernel
+## Generating tokens (qualitative check)
 
 ```bash
+# Baseline
+python main.py --mode generate \
+  --model-path /home/ubuntu/kchern/models/llama-3.2-1b/ \
+  --compiled-model-path /tmp/llama1b_baseline
+
+# Megakernel
 python main.py --mode generate --enable-nki \
   --model-path /home/ubuntu/kchern/models/llama-3.2-1b/ \
-  --compiled-model-path /home/ubuntu/kchern/traced_model/llama-3.2-1b-megakernel-nki/
+  --compiled-model-path /tmp/llama1b_nki
 ```
 
-To validate end-to-end against the XLA baseline:
+To validate megakernel output token-by-token against the baseline:
 
 ```bash
 python main.py --mode validate --enable-nki \
   --model-path /home/ubuntu/kchern/models/llama-3.2-1b/ \
-  --compiled-model-path /home/ubuntu/kchern/traced_model/llama-3.2-1b-megakernel-nki/
+  --compiled-model-path /tmp/llama1b_nki
 ```
 
 When switching between baseline and megakernel, clear the compile cache:
 
 ```bash
-rm -rf /home/ubuntu/kchern/traced_model/llama-3.2-1b-megakernel-nki \
-       /var/tmp/neuron-compile-cache/*
+rm -rf /tmp/llama1b_baseline /tmp/llama1b_nki /var/tmp/neuron-compile-cache/*
 ```
-
-First compile is ~10-20 min; cached after that.
