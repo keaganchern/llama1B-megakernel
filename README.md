@@ -11,9 +11,9 @@ End-to-end on Trainium 1 (trn1.2xlarge), 640 output tokens, batch_size=1, max_co
 
 | Metric                | Baseline    | Megakernel  |
 |-----------------------|-------------|-------------|
-| Token gen latency p50 | 11.11 ms    | 45.41 ms    | 
-| Token gen throughput  | 90.56 tok/s | 22.05 tok/s | 
-| E2E throughput        | 76.01 tok/s | 21.18 tok/s | 
+| Token gen latency p50 | 11.11 ms    | 11.75 ms    | 
+| Token gen throughput  | 90.56 tok/s | 85.19 tok/s | 
+| E2E throughput        | 76.01 tok/s | 73.44 tok/s | 
 
 
 

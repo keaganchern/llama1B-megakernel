@@ -19,6 +19,10 @@ from llama import (
     NeuronLlamaModel,
     get_updated_configs,
 )
+# Unshadowed alias for the real base class. The module bottom rebinds
+# `NeuronLlamaForCausalLM = NeuronLlamaForCausalLMMK`, so convert_hf_to_neuron_state_dict
+# must call the base through this alias to avoid recursing into itself.
+from llama import NeuronLlamaForCausalLM as _LlamaForCausalLMBase
 
 from transformer_llama import (
     transformer_llama_megakernel_16layers,
@@ -27,7 +31,7 @@ from transformer_llama import (
 from nki_kernels.attention import (
     PMAX, D, NUM_Q_HEADS, NUM_KV_HEADS, NUM_H_TILES,
 )
-from nki_kernels.mlp import NUM_I_TILES
+from nki_kernels.mlp import NUM_I_TILES, down_weight_contig_layout
 
 # Layer-boundary markers used by NxDI to identify the megakernel as a single
 # "layer block" for alias handling through the custom-call.
@@ -111,51 +115,21 @@ class NeuronLlamaDecoderLayerMK(NeuronLlamaDecoderLayer):
             L = LLAMA_1B_NUM_LAYERS
             assert len(parent.layers) == L
 
-            # Cat-stack per-layer weights along the row dim. Each NKI kernel
-            # selects its layer's slice via a single absolute .ap() offset.
-            Wq_stack = torch.cat([
-                _tile_transpose(parent.layers[i].self_attn.qkv_proj.q_proj.weight,
-                                NUM_Q_HEADS, D)
-                for i in range(L)
-            ], dim=0)
-            Wk_stack = torch.cat([
-                _tile_transpose(parent.layers[i].self_attn.qkv_proj.k_proj.weight,
-                                NUM_KV_HEADS, D)
-                for i in range(L)
-            ], dim=0)
-            Wv_stack = torch.cat([
-                _tile_transpose(parent.layers[i].self_attn.qkv_proj.v_proj.weight,
-                                NUM_KV_HEADS, D)
-                for i in range(L)
-            ], dim=0)
-            Wo_stack = torch.cat([
-                parent.layers[i].self_attn.o_proj.o_proj.weight.t().contiguous()
-                for i in range(L)
-            ], dim=0)
-            gpre_stack = torch.cat([
-                parent.layers[i].input_layernorm.weight for i in range(L)
-            ], dim=0)
-            gpost_stack = torch.cat([
-                parent.layers[i].post_attention_layernorm.weight for i in range(L)
-            ], dim=0)
-
-            # Fuse W_gate + W_up along the free dim (cols) so one DMA per
-            # m-tile loads both stationaries contiguously. Per-layer shape:
-            # [NUM_I_TILES*PMAX, 2*NUM_H_TILES*PMAX] = [8192, 4096].
-            Wgu_stack = torch.cat([
-                torch.cat([
-                    _tile_transpose_mlp(parent.layers[i].mlp.gate_proj.weight,
-                                        NUM_I_TILES, NUM_H_TILES),
-                    _tile_transpose_mlp(parent.layers[i].mlp.up_proj.weight,
-                                        NUM_I_TILES, NUM_H_TILES),
-                ], dim=1)
-                for i in range(L)
-            ], dim=0)
-            Wd_stack = torch.cat([
-                _tile_transpose_mlp(parent.layers[i].mlp.down_proj.weight,
-                                    NUM_H_TILES, NUM_I_TILES)
-                for i in range(L)
-            ], dim=0)
+            # Read the per-layer weights pre-stacked ONCE at load time (see
+            # NeuronLlamaForCausalLMMK.convert_hf_to_neuron_state_dict +
+            # NeuronLlamaModelMK.init_model). These are registered model
+            # buffers, so they enter the traced graph as inputs loaded once —
+            # NOT rebuilt every decode step. Rebuilding the ~2.5 GB stacked
+            # weight set per token (the old torch.cat here) was writing ~4 GB
+            # to HBM every step and dominated token-gen latency.
+            Wq_stack = parent.mk_Wq_stack
+            Wk_stack = parent.mk_Wk_stack
+            Wv_stack = parent.mk_Wv_stack
+            Wo_stack = parent.mk_Wo_stack
+            gpre_stack = parent.mk_gpre_stack
+            gpost_stack = parent.mk_gpost_stack
+            Wgu_stack = parent.mk_Wgu_stack
+            Wd_stack = parent.mk_Wd_stack
 
             # KV caches stay as per-layer Parameters (NxDI mutates them across
             # decode steps). The cache manager keeps them in a flat
@@ -181,7 +155,7 @@ class NeuronLlamaDecoderLayerMK(NeuronLlamaDecoderLayer):
             assert tuple(gpre_stack.shape) == (L * 2048,),           tuple(gpre_stack.shape)
             assert tuple(gpost_stack.shape) == (L * 2048,),          tuple(gpost_stack.shape)
             assert tuple(Wgu_stack.shape) == (L * 8192, 2 * 2048),   tuple(Wgu_stack.shape)
-            assert tuple(Wd_stack.shape) == (L * 2048, 8192),        tuple(Wd_stack.shape)
+            assert tuple(Wd_stack.shape) == (L * 4096, 4096),        tuple(Wd_stack.shape)
             for i, k in enumerate(K_caches):
                 assert tuple(k.shape) == (1, 8, 1024, 64), f"K_caches[{i}].shape={tuple(k.shape)}"
             for i, v in enumerate(V_caches):
@@ -245,6 +219,36 @@ class NeuronLlamaModelMK(NeuronLlamaModel):
         for layer in self.layers:
             layer._parent_model_ref = weakref.ref(self)
 
+        # Megakernel stacked weights, registered as model PARAMETERS (not
+        # buffers) and filled ONCE at load time by
+        # NeuronLlamaForCausalLMMK.convert_hf_to_neuron_state_dict. Parameters
+        # are treated as graph INPUTS — loaded once and shared across decode
+        # buckets, exactly like the per-layer weights. Registering them as
+        # buffers instead made NxDI bake the ~2.5 GB stacks as constants into
+        # every bucket's graph, blowing up compile-time host memory. Layer-0's
+        # forward reads these directly, so the per-step traced graph contains no
+        # weight re-stacking (the old per-token torch.cat wrote ~4 GB/token to
+        # HBM and dominated decode latency). Costs ~2.5 GB extra HBM; the
+        # per-layer weights stay resident for the prefill/baseline path.
+        L = LLAMA_1B_NUM_LAYERS
+        dtype = config.neuron_config.torch_dtype
+        H_DIM = NUM_H_TILES * PMAX           # 2048
+        I_DIM = NUM_I_TILES * PMAX           # 8192
+
+        def _buf(name, shape):
+            self.register_parameter(
+                name, nn.Parameter(torch.zeros(shape, dtype=dtype), requires_grad=False)
+            )
+
+        _buf("mk_Wq_stack",    (L * NUM_Q_HEADS * PMAX, NUM_H_TILES * D))   # [65536, 1024]
+        _buf("mk_Wk_stack",    (L * NUM_KV_HEADS * PMAX, NUM_H_TILES * D))  # [16384, 1024]
+        _buf("mk_Wv_stack",    (L * NUM_KV_HEADS * PMAX, NUM_H_TILES * D))  # [16384, 1024]
+        _buf("mk_Wo_stack",    (L * NUM_Q_HEADS * D, H_DIM))                # [32768, 2048]
+        _buf("mk_gpre_stack",  (L * H_DIM,))                                # [32768]
+        _buf("mk_gpost_stack", (L * H_DIM,))                                # [32768]
+        _buf("mk_Wgu_stack",   (L * I_DIM, 2 * H_DIM))                      # [131072, 4096]
+        _buf("mk_Wd_stack",    (L * NUM_H_TILES * 2 * PMAX, NUM_I_TILES * PMAX // 2))  # [65536, 4096] contiguous-split
+
 
 class NeuronConfigLlamaMK(NeuronConfigNKI):
     """NeuronConfig variant that tells NxDI the megakernel updates KV in-place.
@@ -273,6 +277,78 @@ class NeuronLlamaForCausalLMMK(NeuronLlamaForCausalLM):
     @classmethod
     def get_neuron_config_cls(cls):
         return NeuronConfigLlamaMK
+
+    @staticmethod
+    def convert_hf_to_neuron_state_dict(state_dict, config):
+        """Run the base conversion, then pre-stack the per-layer weights ONCE.
+
+        The megakernel needs all 16 layers' weights cat-stacked and
+        tile-transposed into 8 big tensors. Doing that here (host side, once)
+        and storing the result under the `mk_*_stack` keys — which load into the
+        buffers registered in NeuronLlamaModelMK.init_model — keeps the
+        per-step traced forward free of the ~2.5 GB torch.cat that previously
+        ran every decode token.
+
+        Config note: NeuronConfigLlamaMK has fused_qkv=False and
+        fused_rmsnorm_skip_gamma=False at the NxDI level, so the base conversion
+        leaves q/k/v/gate/up raw. We then do our OWN fused-RMSNorm fold here:
+        input_layernorm gamma folded into q/k/v, post_attention_layernorm gamma
+        folded into gate/up — so the kernel's RMSNorm applies only the 1/rms
+        scale (no per-layer gamma load or multiply). Wo and down stay unfolded
+        (their inputs aren't RMSNorm outputs).
+        """
+        state_dict = _LlamaForCausalLMBase.convert_hf_to_neuron_state_dict(
+            state_dict, config
+        )
+        L = LLAMA_1B_NUM_LAYERS
+        dtype = config.neuron_config.torch_dtype
+
+        def w(i, name):
+            return state_dict[f"layers.{i}.{name}"]
+
+        def stack(parts):
+            return torch.cat(parts, dim=0).contiguous().to(dtype)
+
+        def fold_gamma(weight, gamma):
+            # Fused RMSNorm: out = W @ (x/rms * gamma) = (W * gamma) @ (x/rms).
+            # Fold gamma into each input (hidden) column of W so the kernel's
+            # RMSNorm applies only the 1/rms scale. fp32 to minimize rounding.
+            return (weight.float() * gamma.float().unsqueeze(0)).to(dtype)
+
+        state_dict["mk_Wq_stack"] = stack(
+            [_tile_transpose(fold_gamma(w(i, "self_attn.q_proj.weight"), w(i, "input_layernorm.weight")), NUM_Q_HEADS, D) for i in range(L)]
+        )
+        state_dict["mk_Wk_stack"] = stack(
+            [_tile_transpose(fold_gamma(w(i, "self_attn.k_proj.weight"), w(i, "input_layernorm.weight")), NUM_KV_HEADS, D) for i in range(L)]
+        )
+        state_dict["mk_Wv_stack"] = stack(
+            [_tile_transpose(fold_gamma(w(i, "self_attn.v_proj.weight"), w(i, "input_layernorm.weight")), NUM_KV_HEADS, D) for i in range(L)]
+        )
+        state_dict["mk_Wo_stack"] = stack(
+            [w(i, "self_attn.o_proj.weight").t().contiguous() for i in range(L)]
+        )
+        state_dict["mk_gpre_stack"] = stack(
+            [w(i, "input_layernorm.weight") for i in range(L)]
+        )
+        state_dict["mk_gpost_stack"] = stack(
+            [w(i, "post_attention_layernorm.weight") for i in range(L)]
+        )
+        state_dict["mk_Wgu_stack"] = stack(
+            [
+                torch.cat(
+                    [
+                        _tile_transpose_mlp(fold_gamma(w(i, "mlp.gate_proj.weight"), w(i, "post_attention_layernorm.weight")), NUM_I_TILES, NUM_H_TILES),
+                        _tile_transpose_mlp(fold_gamma(w(i, "mlp.up_proj.weight"), w(i, "post_attention_layernorm.weight")), NUM_I_TILES, NUM_H_TILES),
+                    ],
+                    dim=1,
+                )
+                for i in range(L)
+            ]
+        )
+        state_dict["mk_Wd_stack"] = stack(
+            [down_weight_contig_layout(_tile_transpose_mlp(w(i, "mlp.down_proj.weight"), NUM_H_TILES, NUM_I_TILES)) for i in range(L)]
+        )
+        return state_dict
 
 
 # Symbol main.py imports when --enable-nki is set.

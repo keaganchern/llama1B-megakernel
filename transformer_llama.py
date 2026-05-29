@@ -43,12 +43,14 @@ def _layer_body_sbuf(
     gpre_all,                              # cat-stacked pre-attn gamma [L*H]
     W_gate_up_all, W_down_all,             # cat-stacked MLP weights (gate+up fused)
     gpost_all,                             # cat-stacked post-attn gamma [L*H]
-    K_cache_i, V_cache_i,                  # input KV cache for this layer (read-only)
-    K_next_i, V_next_i,                    # fresh HBM outputs for this layer
+    K_cache_i, V_cache_i,                  # this layer's KV cache (updated in place)
     cos, sin, position_ids,
     layer_idx,                             # Python int, selects per-layer slice
 ):
-    """Returns a fresh SBUF tile holding the post-layer hidden state."""
+    """Returns a fresh SBUF tile holding the post-layer hidden state.
+
+    The fresh K / V are scattered in place into K_cache_i / V_cache_i.
+    """
     bf16 = nl.bfloat16
 
     attn_out_sb = nl.ndarray((PMAX, NUM_H_TILES), dtype=bf16, buffer=nl.sbuf)
@@ -60,7 +62,6 @@ def _layer_body_sbuf(
         cos=cos, sin=sin,
         position_ids=position_ids,
         out_sb=attn_out_sb,
-        K_next=K_next_i, V_next=V_next_i,
         layer_idx=layer_idx,
     )
 
@@ -115,15 +116,11 @@ def _multilayer_body(
 
     # Per-layer loop. Python `range` so the body is unrolled at trace time;
     # the compiler then overlaps DMAs of layer i+1's weights with compute on
-    # layer i. Each layer writes a fresh K_next_i / V_next_i shared_hbm output
-    # which the caller aliases back to past_key_values[i]. Tried in-place
-    # aliasing — on trn1 the compiler inserts a protective save/restore that
-    # makes HBM traffic worse than the wholesale copy.
-    K_nexts = []
-    V_nexts = []
+    # layer i. Each layer scatters its fresh K / V IN PLACE into K_caches[i] /
+    # V_caches[i]; we return those same cache tensors as pass-through outputs so
+    # the scatter DMAs aren't DCE'd and the caller aliases them back to
+    # past_key_values[i].
     for i in range(num_layers):
-        K_next_i = nl.ndarray((1, NUM_KV_HEADS, S_MAX, D), dtype=bf16, buffer=nl.shared_hbm)
-        V_next_i = nl.ndarray((1, NUM_KV_HEADS, S_MAX, D), dtype=bf16, buffer=nl.shared_hbm)
         h_sb = _layer_body_sbuf(
             h_sb,
             Wq_all, Wk_all, Wv_all, Wo_all,
@@ -131,12 +128,9 @@ def _multilayer_body(
             Wgu_all, Wd_all,
             gpost_all,
             K_caches[i], V_caches[i],
-            K_next_i, V_next_i,
             cos, sin, position_ids,
             i,
         )
-        K_nexts.append(K_next_i)
-        V_nexts.append(V_next_i)
 
     # Final SBUF → HBM store.
     Y = nl.ndarray((1, 1, H), dtype=bf16, buffer=nl.shared_hbm, name="mkN_Y")
@@ -146,8 +140,8 @@ def _multilayer_body(
         ),
         src=h_sb,
     )
-    # (Y, K_next_0..L-1, V_next_0..L-1)
-    return (Y,) + tuple(K_nexts) + tuple(V_nexts)
+    # (Y, K_0..L-1, V_0..L-1) — the in-place-updated input caches.
+    return (Y,) + tuple(K_caches) + tuple(V_caches)
 
 
 @nki.jit
@@ -167,7 +161,7 @@ def transformer_llama_megakernel_1layer(
     K_cache, V_cache,
     cos, sin, position_ids,
 ):
-    """Single-layer megakernel. Returns (Y, K_next, V_next)."""
+    """Single-layer megakernel. Returns (Y, K_cache, V_cache) — KV updated in place."""
     bf16 = nl.bfloat16
 
     h_sbuf = nl.ndarray((PMAX, NUM_H_TILES), dtype=bf16, buffer=nl.sbuf, name="mk1_h_sbuf")
@@ -177,8 +171,6 @@ def transformer_llama_megakernel_1layer(
             pattern=[[1, PMAX], [PMAX, NUM_H_TILES]], offset=0,
         ),
     )
-    K_next = nl.ndarray((1, NUM_KV_HEADS, S_MAX, D), dtype=bf16, buffer=nl.shared_hbm, name="mk1_K_next")
-    V_next = nl.ndarray((1, NUM_KV_HEADS, S_MAX, D), dtype=bf16, buffer=nl.shared_hbm, name="mk1_V_next")
     h_out = _layer_body_sbuf(
         h_sbuf,
         Wq_pt, Wk_pt, Wv_pt, Wo,
@@ -186,7 +178,6 @@ def transformer_llama_megakernel_1layer(
         W_gate_up_pt, W_down_pt,
         gamma_post_attn,
         K_cache, V_cache,
-        K_next, V_next,
         cos, sin, position_ids,
         0,
     )
@@ -197,7 +188,7 @@ def transformer_llama_megakernel_1layer(
         ),
         src=h_out,
     )
-    return Y, K_next, V_next
+    return Y, K_cache, V_cache
 
 
 # Code-gen a top-level kernel wrapper with explicit per-layer K_/V_ args

@@ -34,6 +34,29 @@ NUM_I_TILES = I_DIM // PMAX                 # 64
 EPS = 1e-5
 
 
+def down_weight_contig_layout(wd_tile_transposed):
+    """Reorganize the tile-transposed down weight for static-DMA loading.
+
+    Input  : [NUM_H_TILES*PMAX, NUM_I_TILES*PMAX]  (= [2048, 8192], the output of
+             _tile_transpose_mlp(W_down, NUM_H_TILES, NUM_I_TILES)).
+    Output : [NUM_H_TILES*2*PMAX, NUM_I_TILES*PMAX//2]  (= [4096, 4096]).
+
+    Each per-ht [PMAX, 8192] tile (16KB/partition) is too wide for a static DMA
+    descriptor, and splitting its free dim in place leaves strided halves. This
+    stores the two [PMAX, 4096] halves as separate CONTIGUOUS row-blocks (block
+    (ht, half) at rows [(ht*2+half)*PMAX : +PMAX]) so each kernel half-load is a
+    contiguous static DMA (partition stride == free extent == 4096), matching the
+    gate/up tiles that already convert. Data-identical: the kernel reassembles the
+    original [PMAX, 8192] wd_t in SBUF, so the matmul is unchanged. Operates with
+    tensor methods only (no torch import needed)."""
+    half = NUM_I_TILES * PMAX // 2
+    return (wd_tile_transposed
+            .reshape(NUM_H_TILES, PMAX, 2, half)
+            .permute(0, 2, 1, 3)
+            .reshape(NUM_H_TILES * 2 * PMAX, half)
+            .contiguous())
+
+
 def mlp_block_sbuf(
     h_sbuf,            # [PMAX, NUM_H_TILES] bf16 SBUF — pre-norm input
     W_gate_up_pt,      # [L*NUM_I_TILES*PMAX, 2*NUM_H_TILES*PMAX] bf16 HBM — gate+up fused
@@ -54,15 +77,11 @@ def mlp_block_sbuf(
     rms_eps_sb = nl.ndarray((PMAX, 1), dtype=f32, buffer=nl.sbuf)
     nisa.memset(rms_eps_sb, value=EPS)
 
-    gamma_sb = nl.ndarray((PMAX, NUM_H_TILES), dtype=bf16, buffer=nl.sbuf)
-    nisa.dma_copy(
-        dst=gamma_sb,
-        src=gamma_post_attn.reshape((gamma_post_attn.shape[0],)).ap(
-            pattern=[[1, PMAX], [PMAX, NUM_H_TILES]], offset=layer_idx * H,
-        ),
-    )
-
-    # 2. Post-attention RMSNorm: h_normed = RMSNorm(h_sbuf) * gamma.
+    # 2. Post-attention RMSNorm. post_attention_layernorm gamma is FOLDED into
+    # the gate/up weights at load (fused RMSNorm — see
+    # NeuronLlamaForCausalLMMK.convert_hf_to_neuron_state_dict), so the kernel
+    # applies only the 1/rms scale — no per-layer gamma load or gamma multiply:
+    #   h_normed = h_sbuf / rms(h_sbuf), cast to bf16.
     h_f32 = nl.ndarray((PMAX, NUM_H_TILES), dtype=f32, buffer=nl.sbuf)
     nisa.tensor_copy(h_f32, h_sbuf)
     h_sq = nl.ndarray((PMAX, NUM_H_TILES), dtype=f32, buffer=nl.sbuf)
@@ -73,10 +92,8 @@ def mlp_block_sbuf(
     nisa.nc_matmul(h_sq_total_psum, stationary=rms_ones, moving=h_sq_partial)
     rms_inv = nl.ndarray((PMAX, 1), dtype=f32, buffer=nl.sbuf)
     nisa.activation(rms_inv, op=nl.rsqrt, data=h_sq_total_psum, scale=(1.0 / H), bias=rms_eps_sb)
-    h_scaled = nl.ndarray((PMAX, NUM_H_TILES), dtype=f32, buffer=nl.sbuf)
-    nisa.tensor_scalar(h_scaled, data=h_f32, op0=nl.multiply, operand0=rms_inv)
     h_normed = nl.ndarray((PMAX, NUM_H_TILES), dtype=bf16, buffer=nl.sbuf)
-    nisa.tensor_tensor(h_normed, h_scaled, gamma_sb, op=nl.multiply)
+    nisa.tensor_scalar(h_normed, data=h_f32, op0=nl.multiply, operand0=rms_inv)
 
     # 3. Gate + Up + SwiGLU: one I-output tile at a time, streaming weights.
     # For each m ∈ [0, NUM_I_TILES):
@@ -96,12 +113,18 @@ def mlp_block_sbuf(
         # Single fused DMA loads [PMAX, 2*NUM_H_TILES*PMAX] = both gate and up.
         # gate stationary lives at cols [0:_wgu_cols], up at [_wgu_cols:2*_wgu_cols].
         wgu_t = nl.ndarray((PMAX, 2 * _wgu_cols), dtype=bf16, buffer=nl.sbuf)
+        # Static DMA (dge_mode.none): the default swdge fragments this contiguous
+        # per-tile weight read into ~6KB per-partition packets (+ 4B descriptor
+        # packets), capping weight MBU at ~55%. Offsets here are all compile-time
+        # constants, so a static descriptor coalesces the transfer. (AWS mlp_tkg
+        # does the same.)
         nisa.dma_copy(
             dst=wgu_t,
             src=W_gate_up_pt.ap(
                 pattern=[[_wgu_row_stride, PMAX], [1, _wgu_row_stride]],
                 offset=(layer_idx * _wgu_layer_rows + m * PMAX) * _wgu_row_stride,
             ),
+            dge_mode=nisa.dge_mode.none,
         )
 
         gate_psum = nl.ndarray((PMAX, 1), dtype=f32, buffer=nl.psum)
@@ -135,26 +158,36 @@ def mlp_block_sbuf(
 
     # 4. Down projection. For each H-output tile ht:
     #   out_sb[:, ht] = sum_{i_t} mlp_inter_sb[:, i_t] @ W_down[ht, i_t]
-    _wd_row_stride = NUM_I_TILES * PMAX
-    _wd_layer_rows = NUM_H_TILES * PMAX
+    # W_down_pt is in the contiguous-split layout (down_weight_contig_layout): the
+    # two [PMAX, _wd_half] halves of each ht-tile are separate contiguous row-blocks.
+    # Load each half into its OWN full [PMAX, _wd_half=4096] buffer (8KB/partition) —
+    # this is the size that converts to static DMA, like gate/up. A [PMAX, 8192]
+    # (16KB/partition) buffer falls back to dynamic regardless of access pattern, so
+    # we never materialise the full-width tile; the matmul accumulates both halves'
+    # 32 i-tiles into one PSUM. half h covers i-tiles [h*32 : h*32+32].
+    _wd_half = NUM_I_TILES * PMAX // 2          # 4096
+    _wd_half_tiles = NUM_I_TILES // 2           # 32
     for ht in nl.affine_range(NUM_H_TILES):
-        wd_t = nl.ndarray((PMAX, NUM_I_TILES * PMAX), dtype=bf16, buffer=nl.sbuf)
-        nisa.dma_copy(
-            dst=wd_t,
-            src=W_down_pt.ap(
-                pattern=[[_wd_row_stride, PMAX], [1, _wd_row_stride]],
-                offset=(layer_idx * _wd_layer_rows + ht * PMAX) * _wd_row_stride,
-            ),
-        )
-
         down_psum = nl.ndarray((PMAX, 1), dtype=f32, buffer=nl.psum)
         nisa.memset(down_psum, value=0.0)
-        for i_t in nl.affine_range(NUM_I_TILES):
-            nisa.nc_matmul(
-                down_psum,
-                stationary=wd_t[0:PMAX, i_t * PMAX:(i_t + 1) * PMAX],
-                moving=mlp_inter_sb[0:PMAX, i_t:i_t + 1],
+        for half in range(2):
+            wd_h = nl.ndarray((PMAX, _wd_half), dtype=bf16, buffer=nl.sbuf)
+            _row = (layer_idx * NUM_H_TILES * 2 + ht * 2 + half) * PMAX
+            nisa.dma_copy(
+                dst=wd_h,
+                src=W_down_pt.ap(
+                    pattern=[[_wd_half, PMAX], [1, _wd_half]],
+                    offset=_row * _wd_half,
+                ),
+                dge_mode=nisa.dge_mode.none,
             )
+            for i_local in nl.affine_range(_wd_half_tiles):
+                nisa.nc_matmul(
+                    down_psum,
+                    stationary=wd_h[0:PMAX, i_local * PMAX:(i_local + 1) * PMAX],
+                    moving=mlp_inter_sb[0:PMAX,
+                                        half * _wd_half_tiles + i_local:half * _wd_half_tiles + i_local + 1],
+                )
 
         nisa.tensor_copy(out_sb[0:PMAX, ht:ht + 1], down_psum)
 
